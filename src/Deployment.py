@@ -1,172 +1,23 @@
 import streamlit as st
 import pydeck as pdk
-import h5py
-import numpy as np
-import pandas as pd
-from scipy.stats import norm
 import datetime
 import matplotlib.pyplot as plt
+import scipy.ndimage
+import numpy as np
+import pandas as pd
 
+from NN_loss import iou
+from OurModel import getOurModel
+from loadData import getTestData
 
-def sigmoid(x):
-	return 1 / (1 + np.exp(-x))
-
-
-TEST_DATASET_PATH = 'test.hdf5'
-
-
-@st.cache
-def getTestData():
-	def getDataDict(DatasetPath):
-		with h5py.File(DatasetPath, 'r') as f:
-			data = {}
-			for k in list(f):
-				data[k] = f[k][:]
-			return data
-
-	test_data = getDataDict(TEST_DATASET_PATH)
-
-	def transformDateTime(datetime):
-		ret = np.asarray(([[x] * 30 for x in datetime]))
-		return ret
-
-	def transformLandCover(landCover):
-		nanConvert = {
-			0: 0,
-			1: 0,
-			2: 9,
-			3: 0,
-			4: 235,
-			5: 0,
-			6: 0,
-			16: 0
-		}
-		ret = []
-
-		for datapoint in landCover:
-			for i in range(17):
-				if i in nanConvert.keys():
-					datapoint[i][np.isnan(datapoint[i])] = nanConvert[i]
-				if (i == 1):
-					datapoint[i] /= 14.0
-				if (i == 2):
-					datapoint[i] = 1 - (datapoint[i] - 9) / 30.0
-				if (i == 3):
-					datapoint[i] = 1 - (datapoint[i] - 32) / 70.0
-				if (i == 4):
-					datapoint[i] = 1 - (datapoint[i] - 235) / 340.0
-				if (i == 5):
-					datapoint[i] = norm(1250, 564).pdf(datapoint[i])
-			ret.append(datapoint)
-		return np.asarray(ret)
-
-	def transformLatAndLong(val):
-		ret = np.asarray([x * np.ones((1, 30, 30)) for x in val])
-		return ret
-
-	# TODO : define temperature according to datetime average
-	def transformMet(met, date):
-		nanConvert = {
-			1: 26,
-			2: 0,
-			3: 0,
-			4: 0,
-		}
-		met0 = []
-		met1 = []
-		index = 0
-		for datapoint in met:
-			for i in range(5):
-				if (i == 0):
-					if pd.to_datetime(date[index]).hour > 12:
-						datapoint[1][i][np.isnan(datapoint[1][i])] = 290
-						datapoint[0][i][np.isnan(datapoint[0][i])] = 301.91
-						datapoint[0][i] = np.tanh(datapoint[0][i] - 301.91)
-						datapoint[1][i] = np.tanh(datapoint[1][i] - 290)
-					else:
-						datapoint[1][i][np.isnan(datapoint[1][i])] = 302.54
-						datapoint[0][i][np.isnan(datapoint[0][i])] = 287.56
-						datapoint[0][i] = np.tanh(datapoint[0][i] - 287.56)
-						datapoint[1][i] = np.tanh(datapoint[1][i] - 302.54)
-				else:
-					datapoint[0][i][np.isnan(datapoint[0][i])] = nanConvert[i]
-					datapoint[1][i][np.isnan(datapoint[1][i])] = nanConvert[i]
-				if (i == 1):
-					datapoint[0][i] = 1 - sigmoid(datapoint[0][i] - 26)
-					datapoint[1][i] = 1 - sigmoid(datapoint[1][i] - 26)
-				if (i == 2):
-					datapoint[0][i] = np.tanh(datapoint[0][i] - 0.4232)
-					datapoint[1][i] = np.tanh(datapoint[1][i] - 1.4365)
-				if (i == 3):
-					datapoint[0][i] = np.tanh(datapoint[0][i] + 0.0854)
-					datapoint[1][i] = np.tanh(datapoint[1][i] - 0.495)
-			met0.append(datapoint[0])
-			met1.append(datapoint[1])
-			index += 1
-		return np.asarray(met0), np.asarray(met1)
-
-	def transformFire(fire):
-		return np.asarray(fire)
-
-	# transform all of them into dict of 3d np arrays.
-	# Augmentation step must take place after this.
-	# Can store this in h5py file after this.
-	def transformAndClean(data):
-		X = {}
-		Y = {}
-		X['datetime'] = transformDateTime(data['datetime'])
-		X['landCover'] = transformLandCover(data['land_cover'])
-		X['latitude'] = transformLatAndLong(data['latitude'])
-		X['longitude'] = transformLatAndLong(data['longitude'])
-		X['met0'], X['met1'] = transformMet(data['meteorology'], data['datetime'])
-		X['observed'] = transformFire(data['observed'])
-		Y['target'] = transformFire(data['target'])
-		return X, Y
-
-	testX, testY = transformAndClean(test_data)
-	startDictionary = {
-		'datetime': 0,
-		'landCover': 1,
-		'latitude': 18,
-		'longitude': 19,
-		'met0': 20,
-		'met1': 25,
-		'observed': 30,
-		'target': 0
-	}
-
-	lengthDictionary = {
-		'datetime': 1,
-		'landCover': 17,
-		'latitude': 1,
-		'longitude': 1,
-		'met0': 5,
-		'met1': 5,
-		'observed': 5,
-		'target': 2
-	}
-
-	def flattenData(data):
-		length = 0
-		for key, value in data.items():
-			length += value.shape[1]
-			n = value.shape[0]
-		ret = np.zeros((n, length, 30, 30))
-		for key, arr in data.items():
-			for index, datapoint in enumerate(arr):
-				ret[index][startDictionary[key]: startDictionary[key] + lengthDictionary[key]][:][:] = datapoint
-		return ret;
-
-	# flatX = flattenData(X)
-	# flatY = flattenData(Y)
-	flatTestX = flattenData(testX)
-	flatTestY = flattenData(testY)
-
-	datetime = np.asarray([pd.to_datetime(x[0][0][0]) for x in flatTestX])
-	return flatTestX, flatTestY, datetime
 
 
 flatTestX, flatTestY, dateArr = getTestData()
+
+ourModel = getOurModel(flatTestX)
+
+def persistenceModel(x):
+	return scipy.ndimage.gaussian_filter(x, 1.7, output=np.float32)
 
 masterdict = {
 	0: 'datetime',
@@ -206,6 +57,7 @@ masterdict = {
 	34: 'observed -48'
 }
 
+
 def _max_width_():
 	max_width_str = f"max-width: 1900px;"
 	st.markdown(
@@ -219,8 +71,13 @@ def _max_width_():
 		unsafe_allow_html=True,
 	)
 
-
 _max_width_()
+
+st.sidebar.title("CS 274P Project: Predicting California Wildfires")
+
+
+# st.sidebar.markdown("<h1 style='text-align: center; color: black;'>CS 274P Project: Predicting California Wildfires</h1>",
+#                     unsafe_allow_html=True)
 
 startDate = st.sidebar.date_input('Pick A Date', datetime.date(2013, 1, 1))
 index = np.searchsorted(dateArr, pd.to_datetime(startDate))
@@ -231,63 +88,137 @@ for i in range(index, index + 10):
 date = st.sidebar.selectbox("Select the instance", vals)
 index = np.searchsorted(dateArr, pd.to_datetime(date))
 
-# lat = np.asarray( [x[18][0][0] for x in flatTestX ] )
-# long = np.asarray( [x[19][0][0] for x in flatTestX ] )
+lat = flatTestX[index][18][0][0]
+lon = flatTestX[index][19][0][0]
+mapData = {
+	"lat": [lat],
+	"lon": [lon]
+}
+
+
+initial_view_state = pdk.ViewState(
+	latitude=lat,
+	longitude=lon,
+	zoom=14,
+	pitch=60,
+	height =400,
+	width = 1200
+)
+
+r = pdk.Deck(
+	map_style='mapbox://styles/mapbox/satellite-streets-v9',
+	initial_view_state=initial_view_state,
+	layers=[
+		pdk.Layer(
+			'ScatterplotLayer',
+			data=pd.DataFrame(mapData),
+			get_position='[lon, lat]',
+			get_color='[200, 30, 0, 160]',
+			get_radius=300,
+		),
+	],
+)
+
+initial_view_state = pdk.ViewState(
+	latitude=lat,
+	longitude=lon,
+	zoom=14,
+	pitch=60,
+	height =400,
+	width = 1200
+)
+st.pydeck_chart(r)
+r.initial_view_state = initial_view_state
+r.update()
+
+
+# plt.figure(figsize=(5, 5))
+#
+# plt.subplot(1,5,5)
+# # plt.title('Fire at 0 hours')
+# plt.imshow(flatTestX[index][30])
+# plt.axis('off')
+#
+#
+# st.pyplot()
+
+ignitionFeatures = [2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 20, 21, 22, 23]
+observedFeatures = [30, 31, 32, 33, 34]
+yfeatures = [0]
+
+
+allFeatures = [2,3,20,21,8,9,10,11,12,14,15,17,0,22,23,4,5,7,13,30,31,32,33,34]
 
 
 
-# index = 1170
+modelTestIgnition = np.take(flatTestX, ignitionFeatures, axis=1)
+modelTestObserved = np.take(flatTestX, observedFeatures, axis=1)
+modelTestY = np.take(flatTestY, yfeatures, axis=1)
 
+cnnTestX= np.take(flatTestX,allFeatures,axis=1)
+
+for datapoint in modelTestIgnition:
+	hr = (pd.to_datetime(datapoint[0][0][0]).hour-12)/24
+	datapoint[0]=0*np.ones((30,30))
+
+
+
+
+
+st.markdown("<h1 style='text-align: center; color: black;'>Observed Wildfires</h1>", unsafe_allow_html=True)
+
+
+ourModel_pred = ourModel.predict(x=  [ np.reshape(modelTestObserved[index], (1, -1,30,30)), np.reshape(modelTestIgnition[index], (1, -1,30,30))])[0]
+# cnn_pred = cnnModel.predict(x=  [ np.reshape(cnnTestX[index], (1, -1,30,30))])[0]
+
+# cnn_pred_2 = cnnModel.predict(x=  [cnnTestX])
+# st.text(np.sum(cnn_pred_2))
+
+
+plt.figure(figsize=(12, 3))
 
 for i in range(5):
-	plt.rcParams['figure.figsize'] = (18, 18)
-	plt.subplot(2, 5, i + 1)
+	plt.subplot(1, 5, i + 1)
 	plt.title(f'{-12 * (4 - i)} hours')
 	plt.imshow(flatTestX[index][34 - i])
 	plt.axis('off')
 
+st.pyplot()
 
+# st.markdown("<h1 style='text-align: center; color: black;'>Predicted Wildfires - Persistence Model</h1>",
+#             unsafe_allow_html=True)
+# st.markdown("<br>", unsafe_allow_html=True)
 
-lat = flatTestX[index][18][0][0]
-lon = flatTestX[index][19][0][0]
-mapData= {
-	"lat": [lat] ,
-	"lon": [lon]
-}
-initial_view_state = pdk.ViewState(
-		latitude = lat,
-		longitude = lon,
-		zoom = 12,
-		pitch = 50,
-	    height=350,
-		width=500,
-)
-r = pdk.Deck(
-	map_style = 'mapbox://styles/mapbox/light-v9',
-	initial_view_state = initial_view_state,
-	layers = [
-		pdk.Layer(
-			'ScatterplotLayer',
-			data = pd.DataFrame(mapData),
-			get_position = '[lon, lat]',
-			get_color = '[200, 30, 0, 160]',
-			get_radius = 180,
-		),
-	],
-)
-initial_view_state = pdk.ViewState(
-		latitude = lat,
-		longitude = lon,
-		zoom = 12,
-		pitch = 50,
-	    height=350,
-		width=500,
-	)
-st.pydeck_chart(r)
-r.initial_view_state= initial_view_state
-r.update()
+# plt.figure(figsize=(17,3))
+#
+plt.subplot(1,3,1)
+plt.imshow(persistenceModel(flatTestX[index][30]))
+plt.title('Persistance Model')
+plt.axis('off')
+#
+plt.subplot(1, 3, 2)
+plt.imshow(np.where(ourModel_pred[0]>0.9,1,0))
+plt.title('Concatenated CNN Model')
+plt.axis('off')
 
+# plt.subplot(1, 3, 3)
+# plt.imshow(np.where(cnn_pred[0]>0.2,1,0))
+# plt.title('One layer CNN Model')
+# plt.axis('off')
 
+plt.subplot(1,3,3)
+plt.imshow(flatTestY[index][0])
+plt.title('Y (T = +12 hours)')
+plt.axis('off')
 
 st.pyplot()
-# st.title(index)
+
+# st.markdown("<h1 style='text-align: center; color: black;'>Map Representation</h1>", unsafe_allow_html=True)
+
+
+
+# st.markdown("<h1 style='text-align: center; color: black;'>CS 274P Project: Predicting California Wildfires</h1>",
+#             unsafe_allow_html=True)
+st.markdown(
+	"<h2 style='text-align: center; color: black;'>Wildfires in California have led to ecological and wildlife destruction in the recent past and this accelerates with climate change. While it is not possible to curb every wildfire, timely detection of wildfires can help in minimising the environmental loss. Hence, we use Deep Learning Techniques to predict the spread of these wildfires.</h2>",
+	unsafe_allow_html=True)
